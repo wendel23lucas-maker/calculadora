@@ -901,32 +901,32 @@
     <!-- PAINEL 5B: Histórico de Pesagem (Firebase) -->
     <div class="painel" id="historico">
       <div class="campo" style="margin-bottom:14px;">
-        <label>Data</label>
+        <label>Item ou A.R.</label>
         <div class="input-group">
-          <input type="date" id="histData">
+          <input type="text" id="histFiltro" placeholder="Início do código (ex: TC-340) ou nº da A.R. (ex: 118009)">
         </div>
       </div>
       <div class="campo" style="margin-bottom:14px;">
-        <label>Filtrar por item ou A.R. <small style="color:var(--muted); text-transform:none; font-weight:500;">(opcional)</small></label>
+        <label>Data <small style="color:var(--muted); text-transform:none; font-weight:500;">(opcional — filtra só um dia)</small></label>
         <div class="input-group">
-          <input type="text" id="histFiltro" placeholder="Ex: TC-340-N1 ou 118009">
+          <input type="date" id="histData">
         </div>
       </div>
       <button type="button" onclick="carregarHistoricoPesagem()">🔄 Buscar histórico</button>
 
       <div class="resumo-ar" id="histResumo" style="margin-top:16px;">
-        <div><b id="hist_qtdCaixas">0</b> caixas · <b id="hist_qtdPecas">0</b> peças · <b id="hist_peso">0</b> peso total nesse dia</div>
+        <div><b id="hist_qtdCaixas">0</b> caixas · <b id="hist_qtdPecas">0</b> peças · <b id="hist_peso">0</b> peso total</div>
       </div>
 
       <div class="tabela-caixas" id="histTabelaWrap" style="margin-top:14px;max-height:340px;">
-        <div class="vazio-tabela">Escolha uma data e clique em buscar.</div>
+        <div class="vazio-tabela">Digite o item ou a A.R. (ou escolha uma data) e clique em buscar.</div>
       </div>
 
       <hr style="border:0; border-top:1px solid var(--borda); margin: 22px 0 16px;">
 
       <h3 style="font-size:0.95rem; color:var(--teal); margin:0 0 4px 0;">🖨️ Carregar A.R. para impressão (uso no PC)</h3>
       <div style="font-size:0.78rem;color:var(--muted);margin-bottom:12px;">
-        Pese pelo celular normalmente. Aqui no PC, busque a data acima (e opcionalmente filtre pelo nº da A.R. no campo de filtro),
+        Pese pelo celular normalmente. Aqui no PC, busque acima pelo item ou nº da A.R. (e opcionalmente restrinja a uma data),
         depois clique no botão abaixo — a tabela é remontada a partir do histórico salvo na nuvem e a folha já sai pronta para impressão, com o nº da A.R. no cabeçalho.
       </div>
       <button type="button" class="btn-imprimir" onclick="carregarNfDoHistoricoEImprimir()">📥 Carregar A.R. do histórico e imprimir</button>
@@ -993,13 +993,16 @@
   // Relatório de A.R. (SUP5000 - Relação de Avisos de Rec. em Processo de Contagem)
   let dadosAR = [];          // [{ar, seq, codItem, denominacao, um, dataInclusao, dataEntrada, atr, valor, prazoCont}]
   let arSelecionadaAtual = null; // {ar, seq} escolhida na busca atual
-  const CHAVE_AR_LOCALSTORAGE = 'calc_recebimento_relatorioAR';
+  // Guardado na nuvem (Firestore) — assim fica disponível tanto no PC quanto no celular,
+  // e some da lista automaticamente em todos os aparelhos assim que um item é pesado.
+  const REF_RELATORIO_AR = () => db.collection('relatorio_ar').doc('atual');
 
   // CORREÇÃO DO ERRO DE PERMISSÃO: Fazer Login Anônimo antes de ler/gravar
   firebase.auth().signInAnonymously()
     .then(() => {
       console.log("Autenticado anonimamente com sucesso!");
       carregarEstoqueFirebase(); // Carrega os dados somente DEPOIS de logar
+      iniciarListenerRelatorioAR(); // Mantém o relatório de A.R. sincronizado em tempo real (PC + celular)
     })
     .catch((error) => {
       console.error("Erro de Autenticação Firebase:", error);
@@ -1014,12 +1017,6 @@
       ativarAba(tab.dataset.tab);
     });
   });
-
-  // Recupera o relatório de A.R. salvo (se já foi carregado hoje)
-  carregarRelatorioARLocal();
-
-  // Data padrão do filtro de histórico = hoje
-  document.getElementById('histData').value = new Date().toISOString().slice(0,10);
 
   function ativarAba(idAba) {
     document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -1097,32 +1094,43 @@
     return registros;
   }
 
-  function salvarRelatorioARLocal() {
-    try {
-      localStorage.setItem(CHAVE_AR_LOCALSTORAGE, JSON.stringify({
-        data: new Date().toISOString().slice(0,10),
-        horaStr: new Date().toLocaleTimeString('pt-BR', {hour:'2-digit', minute:'2-digit'}),
-        registros: dadosAR
-      }));
-    } catch (e) { /* localStorage cheio ou indisponível — segue só em memória */ }
+  function salvarRelatorioARFirebase() {
+    return REF_RELATORIO_AR().set({
+      data: new Date().toISOString().slice(0,10),
+      horaStr: new Date().toLocaleTimeString('pt-BR', {hour:'2-digit', minute:'2-digit'}),
+      registros: dadosAR,
+      atualizadoEm: firebase.firestore.FieldValue.serverTimestamp()
+    }).catch((e) => console.error('Erro ao salvar relatório de A.R. na nuvem:', e));
   }
 
-  function carregarRelatorioARLocal() {
-    try {
-      const bruto = localStorage.getItem(CHAVE_AR_LOCALSTORAGE);
-      if (!bruto) return;
-      const obj = JSON.parse(bruto);
+  // Escuta o documento do relatório em tempo real: qualquer alteração feita no PC
+  // ou no celular (carregar novo relatório, ou um item saindo por ter sido pesado)
+  // aparece automaticamente nos dois aparelhos, sem precisar recarregar a página.
+  function iniciarListenerRelatorioAR() {
+    REF_RELATORIO_AR().onSnapshot((doc) => {
+      if (!doc.exists) {
+        dadosAR = [];
+        atualizarResumoRelatorioAR();
+        renderItensLiberadosAR();
+        return;
+      }
+      const obj = doc.data();
       dadosAR = obj.registros || [];
+
       const hojeStr = new Date().toISOString().slice(0,10);
       const aviso = document.getElementById('avisoRelatorioAR');
-      if (obj.data !== hojeStr) {
+      if (obj.data && obj.data !== hojeStr) {
         aviso.style.display = 'block';
-        aviso.textContent = `⚠️ Este relatório é de ${obj.data ? obj.data.split('-').reverse().join('/') : 'uma data anterior'}. Carregue o relatório de hoje para dados atualizados.`;
+        aviso.textContent = `⚠️ Este relatório é de ${obj.data.split('-').reverse().join('/')}. Carregue o relatório de hoje para dados atualizados.`;
       } else {
         aviso.style.display = 'none';
       }
+
       atualizarResumoRelatorioAR(obj.horaStr);
-    } catch (e) { /* ignora dado corrompido */ }
+      renderItensLiberadosAR();
+    }, (error) => {
+      console.error('Erro ao sincronizar relatório de A.R.:', error);
+    });
   }
 
   function atualizarResumoRelatorioAR(horaStr) {
@@ -1158,16 +1166,16 @@
     }
     dadosAR = registros;
     document.getElementById('avisoRelatorioAR').style.display = 'none';
-    salvarRelatorioARLocal();
+    salvarRelatorioARFirebase();
     atualizarResumoRelatorioAR();
   }
 
   function limparRelatorioAR() {
     if (!dadosAR.length) return;
-    if (!confirm('Limpar o relatório de A.R. carregado?')) return;
+    if (!confirm('Limpar o relatório de A.R. carregado? Isso também remove o relatório salvo na nuvem (afeta todos os aparelhos).')) return;
     dadosAR = [];
     arSelecionadaAtual = null;
-    localStorage.removeItem(CHAVE_AR_LOCALSTORAGE);
+    REF_RELATORIO_AR().delete().catch((e) => console.error('Erro ao limpar relatório na nuvem:', e));
     document.getElementById('colarRelatorioAR').value = '';
     document.getElementById('avisoRelatorioAR').style.display = 'none';
     atualizarResumoRelatorioAR();
@@ -1232,7 +1240,7 @@
       }
       dadosAR = registros;
       document.getElementById('avisoRelatorioAR').style.display = 'none';
-      salvarRelatorioARLocal();
+      salvarRelatorioARFirebase();
       atualizarResumoRelatorioAR();
     } catch (err) {
       status.textContent = '❌ Erro ao ler o arquivo: ' + err.message;
@@ -1312,8 +1320,10 @@
     const itensDaAr = dadosAR.filter(r => r.ar === arSelecionadaAtual.ar);
     if (!itensDaAr.length) { liberacao.classList.remove('mostrar'); return; }
 
-    // Marca quais já foram pesados nesta sessão (comparando código do item)
-    const codigosPesados = new Set(
+    // Status "pesado" vem do próprio relatório (salvo na nuvem), então reflete
+    // em qualquer aparelho — não só na sessão atual. Mantém também a checagem local
+    // (notaFiscal desta sessão) como reforço, caso a gravação na nuvem ainda não tenha voltado.
+    const codigosPesadosSessao = new Set(
       Object.values(notaFiscal.itens)
         .filter(it => it.codItem)
         .map(it => it.codItem.toLowerCase())
@@ -1323,13 +1333,16 @@
 
     let html = '<table><thead><tr><th>Seq</th><th>Código</th><th>Denominação</th><th>Status</th></tr></thead><tbody>';
     itensDaAr.forEach(r => {
-      const pesado = codigosPesados.has(r.codItem.toLowerCase());
+      const pesado = !!r.pesado || codigosPesadosSessao.has(r.codItem.toLowerCase());
       const atual = arSelecionadaAtual.seq === r.seq;
+      const statusTxt = pesado
+        ? `✅ pesado/conferido${r.pesadoEm ? ` (${r.pesadoEm})` : ''}`
+        : '⏳ pendente';
       html += `<tr class="${pesado ? 'pesado' : ''}${atual ? ' selecionada' : ''}">
         <td>${r.seq}</td>
         <td>${r.codItem}</td>
         <td>${r.denominacao}</td>
-        <td class="badge-status">${pesado ? '✅ pesado' : '⏳ pendente'}</td>
+        <td class="badge-status">${statusTxt}</td>
       </tr>`;
     });
     html += '</tbody></table>';
@@ -1730,6 +1743,7 @@
       const qtd = Math.round(pesoG / item.pesoUnitG);
 
       const caixaObj = { numero: item.caixas.length + 1, pesoG, qtd, firebaseId: null };
+      const primeiraCaixaDoItem = item.caixas.length === 0;
       item.caixas.push(caixaObj);
       renderChipsItens();
       renderTabelaCaixas();
@@ -1737,9 +1751,34 @@
       // Grava no histórico da nuvem (não bloqueia a pesagem se falhar)
       salvarPesagemFirebase(itemAtualNome, item, caixaObj);
 
+      // Assim que o item começa a ser pesado, ele fica marcado como pesado/conferido
+      // no relatório de A.R. (na nuvem, refletindo em todos os aparelhos — PC e celular),
+      // sem sumir da lista.
+      if (primeiraCaixaDoItem && item.ar) {
+          marcarItemPesadoAR(item.ar, item.seq, item.codItem);
+      }
+
       // Limpa e mantém foco no campo para pesar a próxima caixa
       document.getElementById('pesoCaixaInput').value = '';
       document.getElementById('pesoCaixaInput').focus();
+  }
+
+  // Marca a linha correspondente do relatório de A.R. como pesada/conferida e persiste na nuvem.
+  function marcarItemPesadoAR(ar, seq, codItem) {
+      const codItemLower = (codItem || '').toLowerCase();
+      const registro = dadosAR.find(r =>
+          r.ar === ar &&
+          r.seq === seq &&
+          r.codItem.toLowerCase() === codItemLower
+      );
+      if (!registro || registro.pesado) return; // não encontrado, ou já estava marcado
+
+      registro.pesado = true;
+      registro.pesadoEm = new Date().toLocaleTimeString('pt-BR', {hour:'2-digit', minute:'2-digit'});
+
+      salvarRelatorioARFirebase();
+      atualizarResumoRelatorioAR();
+      renderItensLiberadosAR();
   }
 
   function salvarPesagemFirebase(nomeItem, item, caixaObj) {
@@ -1751,6 +1790,7 @@
           nfNumero: document.getElementById('nfNumero').value.trim() || null,
           itemNome: nomeItem,
           codItem: item.codItem || nomeItem,
+          codItemLower: (item.codItem || nomeItem || '').toLowerCase(), // p/ busca indexada por prefixo
           ar: item.ar || null,
           seq: item.seq || null,
           pesoUnitG: item.pesoUnitG,
@@ -1879,11 +1919,13 @@
 
   function carregarHistoricoPesagem() {
       const dataStr = document.getElementById('histData').value;
+      const filtroOriginal = document.getElementById('histFiltro').value.trim();
+      const filtro = filtroOriginal.toLowerCase();
       const wrap = document.getElementById('histTabelaWrap');
       const resumo = document.getElementById('histResumo');
 
-      if (!dataStr) {
-          wrap.innerHTML = '<div class="vazio-tabela">Escolha uma data.</div>';
+      if (!filtro && !dataStr) {
+          wrap.innerHTML = '<div class="vazio-tabela">Digite o item/A.R. ou escolha uma data.</div>';
           return;
       }
 
@@ -1891,38 +1933,88 @@
       resumo.style.display = 'none';
       document.getElementById('erroCarregarNf').style.display = 'none';
 
-      const inicio = new Date(dataStr + 'T00:00:00');
-      const fim = new Date(dataStr + 'T23:59:59.999');
+      // Com data escolhida: continua igual — consulta por intervalo de timestamp
+      // (índice automático de campo único) e refina no cliente, já que o volume
+      // de um único dia é pequeno.
+      if (dataStr) {
+          const inicio = new Date(dataStr + 'T00:00:00');
+          const fim = new Date(dataStr + 'T23:59:59.999');
+          db.collection('historico_pesagem')
+              .where('timestamp', '>=', firebase.firestore.Timestamp.fromDate(inicio))
+              .where('timestamp', '<=', firebase.firestore.Timestamp.fromDate(fim))
+              .orderBy('timestamp', 'desc')
+              .get()
+              .then((snap) => {
+                  let registros = [];
+                  snap.forEach(doc => registros.push({ id: doc.id, ...doc.data() }));
+                  if (filtro) {
+                      registros = registros.filter(r =>
+                          (r.codItem || '').toLowerCase().includes(filtro) ||
+                          (r.itemNome || '').toLowerCase().includes(filtro) ||
+                          (r.ar || '').toString().toLowerCase().includes(filtro) ||
+                          (r.nfNumero || '').toString().toLowerCase().includes(filtro)
+                      );
+                  }
+                  ultimoHistoricoRegistros = registros;
+                  renderHistoricoPesagem(registros, false);
+              })
+              .catch((error) => mostrarErroHistorico(error, wrap));
+          return;
+      }
 
-      db.collection('historico_pesagem')
-        .where('timestamp', '>=', firebase.firestore.Timestamp.fromDate(inicio))
-        .where('timestamp', '<=', firebase.firestore.Timestamp.fromDate(fim))
-        .orderBy('timestamp', 'desc')
-        .get()
+      // Sem data: busca em toda a base usando consulta INDEXADA pelo Firestore
+      // (não baixa a coleção inteira e filtra no cliente).
+      // - Se o texto digitado for só números, trata como nº de A.R. (busca exata pelo campo 'ar').
+      // - Caso contrário, trata como início do código do item (busca por prefixo em 'codItemLower').
+      const isAr = /^\d+$/.test(filtroOriginal);
+      let query;
+      if (isAr) {
+          query = db.collection('historico_pesagem')
+              .where('ar', '==', filtroOriginal)
+              .orderBy('timestamp', 'desc')
+              .limit(500);
+      } else {
+          query = db.collection('historico_pesagem')
+              .where('codItemLower', '>=', filtro)
+              .where('codItemLower', '<=', filtro + '\uf8ff')
+              .orderBy('codItemLower')
+              .limit(500);
+      }
+
+      query.get()
         .then((snap) => {
             let registros = [];
             snap.forEach(doc => registros.push({ id: doc.id, ...doc.data() }));
-
-            // Filtro opcional por item/código, A.R. ou nº da NF (feito no cliente)
-            const filtro = document.getElementById('histFiltro').value.trim().toLowerCase();
-            if (filtro) {
-                registros = registros.filter(r =>
-                    (r.codItem || '').toLowerCase().includes(filtro) ||
-                    (r.itemNome || '').toLowerCase().includes(filtro) ||
-                    (r.ar || '').toString().toLowerCase().includes(filtro) ||
-                    (r.nfNumero || '').toString().toLowerCase().includes(filtro)
-                );
+            if (!isAr) {
+                // Busca por prefixo já vem ordenada por código; reordena por hora (mais recente primeiro)
+                registros.sort((a, b) => {
+                    const ta = a.timestamp && a.timestamp.toDate ? a.timestamp.toDate().getTime() : 0;
+                    const tb = b.timestamp && b.timestamp.toDate ? b.timestamp.toDate().getTime() : 0;
+                    return tb - ta;
+                });
             }
-
             ultimoHistoricoRegistros = registros;
-            renderHistoricoPesagem(registros);
+            renderHistoricoPesagem(registros, true);
         })
-        .catch((error) => {
-            wrap.innerHTML = `<div class="vazio-tabela" style="color:var(--vermelho);">Erro ao buscar histórico: ${error.message}</div>`;
-        });
+        .catch((error) => mostrarErroHistorico(error, wrap));
   }
 
-  function renderHistoricoPesagem(registros) {
+  function mostrarErroHistorico(error, wrap) {
+      console.error('Erro ao buscar histórico:', error);
+      if (error.code === 'failed-precondition') {
+          // Falta criar o índice composto no Firestore. O próprio erro do Firebase
+          // traz um link pronto pra criar o índice em 1 clique — veja no console (F12).
+          wrap.innerHTML = `<div class="vazio-tabela" style="color:var(--vermelho);">
+              Essa busca precisa de um índice no Firestore que ainda não existe.
+              Abra o console do navegador (F12 → Console) e clique no link que aparece no erro
+              para criar o índice automaticamente — depois é só buscar de novo.
+          </div>`;
+      } else {
+          wrap.innerHTML = `<div class="vazio-tabela" style="color:var(--vermelho);">Erro ao buscar histórico: ${error.message}</div>`;
+      }
+  }
+
+  function renderHistoricoPesagem(registros, mostrarData) {
       const wrap = document.getElementById('histTabelaWrap');
       const resumo = document.getElementById('histResumo');
 
@@ -1933,16 +2025,20 @@
       }
 
       let totalCaixas = 0, totalPecas = 0, totalPesoG = 0;
-      let html = '<table><thead><tr><th>Hora</th><th>Item</th><th>AR/Seq (item)</th><th>Peso</th><th>Qtd</th><th>Nº A.R. (folha)</th></tr></thead><tbody>';
+      const colData = mostrarData ? '<th>Data</th>' : '';
+      let html = `<table><thead><tr><th>Hora</th>${colData}<th>Item</th><th>AR/Seq (item)</th><th>Peso</th><th>Qtd</th><th>Nº A.R. (folha)</th></tr></thead><tbody>`;
 
       registros.forEach(r => {
           totalCaixas++;
           totalPecas += r.qtdPecas || 0;
           totalPesoG += r.pesoCaixaG || 0;
-          const hora = r.timestamp && r.timestamp.toDate ? r.timestamp.toDate().toLocaleTimeString('pt-BR', {hour:'2-digit', minute:'2-digit'}) : '-';
+          const dt = r.timestamp && r.timestamp.toDate ? r.timestamp.toDate() : null;
+          const hora = dt ? dt.toLocaleTimeString('pt-BR', {hour:'2-digit', minute:'2-digit'}) : '-';
+          const dataCel = mostrarData ? `<td>${dt ? dt.toLocaleDateString('pt-BR') : '-'}</td>` : '';
           const arSeq = r.ar ? `${r.ar}/${r.seq}` : '-';
           html += `<tr>
             <td>${hora}</td>
+            ${dataCel}
             <td>${r.codItem || r.itemNome}</td>
             <td>${arSeq}</td>
             <td>${formatarNumero(r.pesoCaixaG || 0, 1)} g</td>
